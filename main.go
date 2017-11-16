@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -33,13 +32,12 @@ type metric struct {
 // that all metric names are distinct. I used RW to allow concurrent reads
 // when check that the key exists before locking to save the metric
 type store struct {
-	*sync.RWMutex
 	data map[string]metric
 }
 
 // Initializes the store db for the metric data
 func newStore() *store {
-	return &store{&sync.RWMutex{}, make(map[string]metric)}
+	return &store{make(map[string]metric)}
 }
 
 // Update checks to see if the metric key exists
@@ -47,19 +45,13 @@ func newStore() *store {
 // back to the data store
 func (s *store) update(m metric) error {
 	// check if the metric exists
-	s.RLock()
 	if _, ok := s.data[m.name]; ok {
 		cm := s.data[m.name]
-		s.RUnlock()
 		m.value = cm.value + m.value
 		m.count = cm.count + 1
 		m.mean = m.value / float64(m.count)
-	} else {
-		s.RUnlock()
 	}
-	s.Lock()
 	s.data[m.name] = m
-	s.Unlock()
 	return nil
 }
 
@@ -117,27 +109,54 @@ func parseMetric(line string) (*metric, error) {
 	return &metric{name: name, value: v, mean: v, time: t, count: 1}, nil
 }
 
+type empty struct{}
+type semaphore chan empty
+
+// acquire n resources
+func (s semaphore) P(n int) {
+	e := empty{}
+	for i := 0; i < n; i++ {
+		s <- e
+	}
+}
+
+// release n resources
+func (s semaphore) V(n int) {
+	for i := 0; i < n; i++ {
+		<-s
+	}
+}
+
+func (s semaphore) Signal() {
+	s.V(1)
+}
+
+func (s semaphore) Wait(n int) {
+	s.P(n)
+}
+
 func main() {
 	// initialize the main store db
 	store := newStore()
 
-	// process tickers
+	ingress := make(chan metric)
+	// process feed and tickers
 	go func() {
 		tickerRaw := time.NewTicker(time.Second * 10)
 		tickerCollection := time.NewTicker(time.Second * 30)
 		for {
 			select {
+			case m := <-ingress:
+				_ = store.update(m)
 			case <-tickerRaw.C:
 				fmt.Fprintf(os.Stderr, "(10 sec): Record count %d\n", atomic.LoadUint64(&rawCount))
 				atomic.StoreUint64(&rawCount, 0) // reset the count
 			case <-tickerCollection.C:
 				// could use a text template here to display columns
 				// but this is simple and efficient
-				store.RLock()
 				for _, m := range store.data {
 					fmt.Fprintln(os.Stdout, m.name, "\t", m.mean)
 				}
-				store.RUnlock()
 				store.data = make(map[string]metric) // empty the collection
 			}
 		}
@@ -150,27 +169,21 @@ func main() {
 	}
 	defer l.Close()
 
+	sem := make(semaphore, 10)
 	for {
-		// check if the connection exceeds our max
-		if currentConnections >= maxConnections {
-			l.Close()
-		} else {
-			conn, err := l.Accept()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Connection: %v\n", err)
-				continue
-			}
-
-			currentConnections++
-
-			go connHandler(conn, store)
-
+		sem.Wait(1)
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Connection: %v\n", err)
+			continue
 		}
+		go connHandler(conn, sem, ingress)
 	}
 }
 
 // Handles all the data incoming for the given connection
-func connHandler(conn net.Conn, s *store) {
+func connHandler(conn net.Conn, s semaphore, ingress chan metric) {
+	defer s.Signal()
 	reader := bufio.NewReader(conn)
 
 	for {
@@ -180,7 +193,6 @@ func connHandler(conn net.Conn, s *store) {
 			if err == io.EOF {
 				fmt.Fprintln(os.Stderr, "client terminated: EOF")
 				conn.Close()
-				currentConnections--
 				return
 			}
 		}
@@ -190,7 +202,6 @@ func connHandler(conn net.Conn, s *store) {
 		if line == "" {
 			fmt.Fprintln(os.Stderr, "client terminated: Empty input")
 			conn.Close()
-			currentConnections--
 			return
 		}
 
@@ -199,21 +210,17 @@ func connHandler(conn net.Conn, s *store) {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			conn.Close()
-			currentConnections--
 			return
 		}
 
 		// if the record timestamp is outside the last minute then ignore it
-		if metric.time.Before(time.Now().Add(-60 * time.Second).UTC()) {
+		if metric.time.Before(time.Now().Add(-60*time.Second).UTC()) ||
+			metric.time.After(time.Now()) {
 			continue
 		}
 
 		// save the metric to the store
-		err = s.update(*metric)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error inserting record to store: %v\n", err)
-			return
-		}
+		ingress <- *metric
 
 		// increment our raw 10 min counter
 		atomic.AddUint64(&rawCount, 1)
